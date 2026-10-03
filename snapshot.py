@@ -205,9 +205,16 @@ def load_snapshot(path):
     return payload if isinstance(payload, dict) else None
 
 
-def ids_of(payload):
-    """Return the set of session ids in one snapshot."""
-    return {s.get("sessionId") for s in (payload or {}).get("sessions", [])}
+def keys_of(payload):
+    """Return one pair of session id and transcript path for each session.
+
+    A session has no transcript until its first prompt. The path is in the
+    pair, so the archive also keeps a new copy when a transcript starts.
+    """
+    return {
+        (s.get("sessionId"), s.get("transcript") or "")
+        for s in (payload or {}).get("sessions", [])
+    }
 
 
 def prune():
@@ -231,9 +238,13 @@ def prune():
 def archive(payload):
     """Keep one copy of the snapshot, so a later short list cannot destroy it.
 
-    The script writes a new file only when the list of sessions changes, or
-    when the machine boots again. Without that rule the timer would write
-    1440 identical files each day.
+    The script writes a new file only in these conditions:
+
+    - the list of sessions changes;
+    - a session gets a transcript;
+    - the machine boots again.
+
+    Without that rule the timer would write 1440 identical files each day.
     """
     try:
         os.makedirs(ARCHIVE, mode=0o700, exist_ok=True)
@@ -243,7 +254,7 @@ def archive(payload):
     if paths:
         last = load_snapshot(paths[-1])
         same_boot = (last or {}).get("bootId") == payload.get("bootId")
-        if same_boot and ids_of(last) == ids_of(payload):
+        if same_boot and keys_of(last) == keys_of(payload):
             return
     name = time.strftime("%Y%m%d-%H%M%S", time.localtime(payload["savedAt"]))
     try:
