@@ -2,8 +2,13 @@
 """Save the list of live Claude Code sessions to a file.
 
 Claude Code holds a registry of the live sessions in ~/.claude/sessions. A crash
-or a forced shutdown removes that registry. This script keeps a copy on disk, so
-the command claude-restore can open the same sessions after the next boot.
+or a forced shutdown stops those sessions. This script keeps a copy of the list
+on disk, so the command claude-restore can open the same sessions after the next
+boot.
+
+A crash can also leave old files in the registry. After the boot, a different
+process can get the PID of an old session. The function alive() compares the
+start time of the process with the record, so it ignores those old files.
 
 The script writes the copy only when it finds at least one live session. That
 rule protects the last good copy at a shutdown and at a boot.
@@ -35,13 +40,51 @@ KEEP_DAYS = 60
 STAMP = re.compile(r"^\d{8}-\d{6}\.json$")
 
 
-def alive(pid):
-    """Return True if the process runs now."""
+def proc_start(pid):
+    """Return the start time of a process in clock ticks, or an empty text.
+
+    The value is field 22 of /proc/<pid>/stat. The name of the process in field
+    2 can contain spaces, so the split starts after the last ")". In the fields
+    after the ")", field 3 is item 0, so field 22 is item 19.
+    """
+    try:
+        with open("/proc/%d/stat" % int(pid)) as handle:
+            text = handle.read()
+    except (OSError, TypeError, ValueError):
+        return ""
+    fields = text.rpartition(")")[2].split()
+    return fields[19] if len(fields) > 19 else ""
+
+
+def argv_of(pid):
+    """Return the command line of a process as a list, or an empty list."""
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as handle:
+            return handle.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return []
+
+
+def is_claude(argv):
+    """Return True if a command line starts the claude program."""
+    return bool(argv) and os.path.basename(argv[0]) == "claude"
+
+
+def alive(pid, started=""):
+    """Return True if the process of a registry record runs now.
+
+    After a reboot a new process can get the PID of an old session. The check
+    therefore compares the start time of the process with the value procStart
+    in the record. An older record has no procStart. For that record the
+    process must at least be the claude program.
+    """
     try:
         os.kill(int(pid), 0)
     except (OSError, TypeError, ValueError):
         return False
-    return True
+    if started:
+        return proc_start(pid) == started
+    return is_claude(argv_of(pid))
 
 
 def transcript_of(session_id):
@@ -74,7 +117,8 @@ def from_registry():
                 raw = json.load(handle)
         except (OSError, ValueError):
             continue
-        if not raw.get("sessionId") or not alive(raw.get("pid")):
+        started = str(raw.get("procStart") or "")
+        if not raw.get("sessionId") or not alive(raw.get("pid"), started):
             continue
         out[raw["sessionId"]] = entry_from(raw)
     return list(out.values())
@@ -95,12 +139,8 @@ def from_proc():
     out = {}
     for path in glob.glob("/proc/[0-9]*/cmdline"):
         pid = path.split("/")[2]
-        try:
-            with open(path, "rb") as handle:
-                argv = handle.read().decode("utf-8", "replace").split("\0")
-        except OSError:
-            continue
-        if not argv or os.path.basename(argv[0]) != "claude":
+        argv = argv_of(pid)
+        if not is_claude(argv):
             continue
         flags = {"--resume", "-r", "--session-id"}
         ids = [
